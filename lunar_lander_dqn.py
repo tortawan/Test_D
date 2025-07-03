@@ -107,23 +107,24 @@ def setup_database_tables(conn):
             """)
             conn.commit()
             logger.info("Database tables are ready.")
-    except Exception as e:
-        logger.error(f"Error setting up database tables: {e}")
+    except psycopg2.Error as e:
+        # This handles the race condition where both containers try to create the table.
+        # If the table already exists, we just log it and continue.
+        logger.warning(f"Could not create tables (they might already exist): {e}")
         conn.rollback()
+
 
 def get_or_create_experiment(conn, config: Dict[str, Any]) -> Optional[int]:
     """Inserts a new experiment record if it doesn't exist and returns its ID."""
     if not conn: return None
     try:
         with conn.cursor() as cur:
-            # Check if experiment_id already exists
             cur.execute("SELECT id FROM experiments WHERE experiment_id = %s;", (EXPERIMENT_ID,))
             result = cur.fetchone()
             if result:
                 logger.info(f"Experiment '{EXPERIMENT_ID}' already exists with ID {result[0]}.")
                 return result[0]
             
-            # If not, insert it
             query = sql.SQL("""
                 INSERT INTO experiments (experiment_id, first_hid, second_hid, batch_size, gamma, learning_rate, epsilon_decay, replay_memory_capacity)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
@@ -157,7 +158,7 @@ def log_evaluation_to_database(conn, experiment_run_id: int, episode: int, avg_s
         logger.error(f"Error logging evaluation result to database: {e}")
         conn.rollback()
 
-# --- QNetwork and DQNAgent Classes (No changes needed here) ---
+# --- QNetwork and DQNAgent Classes ---
 class QNetwork(nn.Module):
     def __init__(self, state_size: int, action_size: int, first_hid: int, second_hid: int):
         super(QNetwork, self).__init__()
@@ -193,10 +194,20 @@ class DQNAgentPyTorch:
     def replay(self):
         if len(self.memory) < self.batch_size: return 0.0
         minibatch = random.sample(self.memory, self.batch_size)
-        states, actions, rewards, next_states, dones = map(lambda x: torch.from_numpy(np.array(x)).to(self.device), zip(*minibatch))
-        states, rewards, dones = states.float(), rewards.float().unsqueeze(-1), dones.long().unsqueeze(-1)
-        actions = actions.long().unsqueeze(-1)
-        next_states = next_states.float()
+        
+        # Unpack and convert batch to tensors explicitly for robustness
+        states_np = np.vstack([e[0] for e in minibatch])
+        actions_np = np.array([e[1] for e in minibatch])
+        rewards_np = np.array([e[2] for e in minibatch])
+        next_states_np = np.vstack([e[3] for e in minibatch])
+        dones_np = np.array([e[4] for e in minibatch])
+
+        states = torch.from_numpy(states_np).float().to(self.device)
+        actions = torch.from_numpy(actions_np).long().unsqueeze(-1).to(self.device)
+        rewards = torch.from_numpy(rewards_np).float().unsqueeze(-1).to(self.device)
+        next_states = torch.from_numpy(next_states_np).float().to(self.device)
+        dones = torch.from_numpy(dones_np.astype(np.uint8)).float().unsqueeze(-1).to(self.device)
+
         current_q = self.model(states).gather(1, actions)
         with torch.no_grad():
             next_q = self.model(next_states).max(1)[0].unsqueeze(-1)
@@ -213,7 +224,7 @@ class DQNAgentPyTorch:
         except Exception as e: logger.error(f"Error saving model: {e}")
 
 # --- Evaluation and Plotting ---
-def run_evaluation_phase(env, agent, num_episodes, max_steps):
+def run_evaluation_phase(env, agent, num_episodes, max_steps) -> float:
     scores = []
     for _ in range(num_episodes):
         state, _ = env.reset()
@@ -225,7 +236,10 @@ def run_evaluation_phase(env, agent, num_episodes, max_steps):
             score += reward
             if terminated or truncated: break
         scores.append(score)
-    return np.mean(scores) if scores else -float('inf')
+    
+    mean_score = np.mean(scores) if scores else -float('inf')
+    # *** FIX: Convert numpy float to standard Python float ***
+    return float(mean_score)
 
 def plot_results(db_conn, experiment_run_id):
     if not db_conn or experiment_run_id is None: return
