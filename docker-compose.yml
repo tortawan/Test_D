@@ -1,0 +1,70 @@
+version: '3.8'
+
+services:
+  # -----------------
+  # Database Service
+  # -----------------
+  db:
+    image: postgres:13
+    container_name: postgres_db
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=experiments
+    volumes:
+      # This persists the database data on your local machine
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      # You can connect to the DB from your host machine on port 5432
+      - "5432:5432"
+    networks:
+      - experiment-net
+
+  # ---------------------
+  # Experiment 1 Service
+  # ---------------------
+  lunar-lander-exp1:
+    build: .
+    container_name: lunar-lander-exp1
+    environment:
+      - DB_HOST=db
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=experiments
+      - EXPERIMENT_ID=exp-1-alpha
+    volumes:
+      # Mounts a local folder to save the model weights and plot
+      - ./outputs/exp1:/app/outputs
+    depends_on:
+      - db
+    networks:
+      - experiment-net
+
+  # ---------------------
+  # Experiment 2 Service
+  # ---------------------
+  lunar-lander-exp2:
+    build: .
+    container_name: lunar-lander-exp2
+    environment:
+      - DB_HOST=db
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=experiments
+      - EXPERIMENT_ID=exp-2-beta # A different ID for this experiment
+    volumes:
+      # Mounts a different local folder for this experiment's outputs
+      - ./outputs/exp2:/app/outputs
+    depends_on:
+      - db
+    networks:
+      - experiment-net
+
+# Define the network that allows containers to communicate
+networks:
+  experiment-net:
+    driver: bridge
+
+# Define the volume for persistent database storage
+volumes:
+  postgres_data:
