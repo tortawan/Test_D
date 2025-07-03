@@ -1,6 +1,7 @@
 """
 DQN Agent for Gymnasium's LunarLander-v3 Environment using PyTorch.
-This version is modified to log results to a PostgreSQL database.
+This version logs hyperparameters and evaluation results to a PostgreSQL database
+using a two-table schema.
 """
 
 import random
@@ -21,70 +22,53 @@ import psycopg2
 from psycopg2 import sql
 from typing import Tuple, List, Dict, Any, Optional, Deque
 
-# --- Environment Setup for Docker ---
-# These will be passed from docker-compose.yml
+# --- Environment & Hyperparameter Setup from Environment Variables ---
 DB_NAME = os.getenv("POSTGRES_DB", "experiments")
 DB_USER = os.getenv("POSTGRES_USER", "user")
 DB_PASSWORD = os.getenv("POSTGRES_PASSWORD", "password")
-DB_HOST = os.getenv("DB_HOST", "db") # The service name of the database in docker-compose
+DB_HOST = os.getenv("DB_HOST", "db")
 EXPERIMENT_ID = os.getenv("EXPERIMENT_ID", f"exp_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}")
 
+# --- Core Hyperparameters ---
+exp_spec: Dict[str, Any] = {
+    'first_hid': int(os.getenv('FIRST_HID', 350)),
+    'second_hid': int(os.getenv('SECOND_HID', 150)),
+    'batch_size': int(os.getenv('BATCH_SIZE', 512)),
+    'gamma': float(os.getenv('GAMMA', 0.99)),
+    'learning_rate': float(os.getenv('LEARNING_RATE', 0.0005)),
+    'epsilon_decay': float(os.getenv('EPSILON_DECAY', 0.99)),
+    'replay_memory_capacity': int(os.getenv('REPLAY_MEMORY_CAPACITY', 100000)),
+    'loss_function_type': 'mse',
+    'target_network': False,
+    'step_to_update': 2,
+}
 
-# Workaround for OpenMP runtime error
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
-
-# --- Configuration Constants ---
+# --- Training Configuration ---
 EPISODES: int = 500
 TARGET_SCORE_AVG: float = 250
 MAX_STEPS_PER_EPISODE: int = 1000
 EVAL_EPISODES_COUNT: int = 20
-EVALUATION_FREQUENCY: int = 5
+EVALUATION_FREQUENCY: int = 10
 
-# --- File Paths (for model and plot, CSV is replaced by DB) ---
-MODEL_SAVE_PATH: str = f"/app/outputs/lunar_lander_dqn_{EXPERIMENT_ID}.pth"
-PLOT_PATH: str = f"/app/outputs/lunar_lander_plot_{EXPERIMENT_ID}.png"
+# --- File Paths ---
+OUTPUTS_DIR = "/app/outputs"
+MODEL_SAVE_PATH: str = f"{OUTPUTS_DIR}/lunar_lander_dqn_{EXPERIMENT_ID}.pth"
+PLOT_PATH: str = f"{OUTPUTS_DIR}/lunar_lander_plot_{EXPERIMENT_ID}.png"
 
-# --- Logging Configuration ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(module)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+# --- Basic Setup ---
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-# --- Device Configuration ---
 device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logger.info(f"Using device: {device}")
-
-# --- DQN Agent Hyperparameters ---
-exp_spec: Dict[str, Any] = {
-    'first_hid': 350,
-    'second_hid': 150,
-    'loss_function_type': 'mse',
-    'target_network': False,
-    'batch_size': 512,
-    'gamma': 0.99,
-    'learning_rate': 0.0005,
-    'step_to_update': 2,
-    'epsilon_decay': 0.99,
-    'replay_memory_capacity': 100000
-}
 
 # --- Database Functions ---
 
 def get_db_connection():
-    """Establishes a connection to the PostgreSQL database."""
-    conn = None
-    # Retry connection to give the DB time to start up
+    """Establishes a connection to the PostgreSQL database with retries."""
     for _ in range(5):
         try:
-            conn = psycopg2.connect(
-                dbname=DB_NAME,
-                user=DB_USER,
-                password=DB_PASSWORD,
-                host=DB_HOST,
-                port="5432"
-            )
+            conn = psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port="5432")
             logger.info("Successfully connected to PostgreSQL database.")
             return conn
         except psycopg2.OperationalError as e:
@@ -93,65 +77,88 @@ def get_db_connection():
     logger.error("Failed to connect to the database after several retries.")
     return None
 
-def setup_database_table(conn):
-    """Creates the results table if it doesn't exist."""
-    if not conn:
-        return
+def setup_database_tables(conn):
+    """Creates the experiments and evaluation_results tables if they don't exist."""
+    if not conn: return
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS experiment_results (
+                CREATE TABLE IF NOT EXISTS experiments (
                     id SERIAL PRIMARY KEY,
-                    timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    experiment_id VARCHAR(255) NOT NULL,
+                    experiment_id VARCHAR(255) UNIQUE NOT NULL,
+                    first_hid INT,
+                    second_hid INT,
+                    batch_size INT,
+                    gamma FLOAT,
+                    learning_rate FLOAT,
+                    epsilon_decay FLOAT,
+                    replay_memory_capacity INT,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS evaluation_results (
+                    id SERIAL PRIMARY KEY,
+                    experiment_run_id INT NOT NULL REFERENCES experiments(id) ON DELETE CASCADE,
                     episode INT NOT NULL,
-                    training_reward FLOAT,
-                    average_loss FLOAT,
-                    epsilon_approx FLOAT,
-                    avg_eval_score FLOAT
+                    avg_eval_score FLOAT NOT NULL,
+                    timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 );
             """)
             conn.commit()
-            logger.info("Database table 'experiment_results' is ready.")
+            logger.info("Database tables are ready.")
     except Exception as e:
-        logger.error(f"Error setting up database table: {e}")
+        logger.error(f"Error setting up database tables: {e}")
         conn.rollback()
 
+def get_or_create_experiment(conn, config: Dict[str, Any]) -> Optional[int]:
+    """Inserts a new experiment record if it doesn't exist and returns its ID."""
+    if not conn: return None
+    try:
+        with conn.cursor() as cur:
+            # Check if experiment_id already exists
+            cur.execute("SELECT id FROM experiments WHERE experiment_id = %s;", (EXPERIMENT_ID,))
+            result = cur.fetchone()
+            if result:
+                logger.info(f"Experiment '{EXPERIMENT_ID}' already exists with ID {result[0]}.")
+                return result[0]
+            
+            # If not, insert it
+            query = sql.SQL("""
+                INSERT INTO experiments (experiment_id, first_hid, second_hid, batch_size, gamma, learning_rate, epsilon_decay, replay_memory_capacity)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
+            """)
+            cur.execute(query, (
+                EXPERIMENT_ID,
+                config['first_hid'], config['second_hid'], config['batch_size'], config['gamma'],
+                config['learning_rate'], config['epsilon_decay'], config['replay_memory_capacity']
+            ))
+            exp_id = cur.fetchone()[0]
+            conn.commit()
+            logger.info(f"Created new experiment '{EXPERIMENT_ID}' with ID {exp_id}.")
+            return exp_id
+    except Exception as e:
+        logger.error(f"Error creating experiment record: {e}")
+        conn.rollback()
+        return None
 
-def log_to_database(conn, data: Dict[str, Any]):
-    """Logs a dictionary of data to the database."""
-    if not conn:
-        return
-    
-    # Ensure required fields are present
-    data.setdefault('experiment_id', EXPERIMENT_ID)
-    data.setdefault('training_reward', None)
-    data.setdefault('average_loss', None)
-    data.setdefault('epsilon_approx', None)
-    data.setdefault('avg_eval_score', None)
-
+def log_evaluation_to_database(conn, experiment_run_id: int, episode: int, avg_score: float):
+    """Logs an evaluation result to the database."""
+    if not conn or experiment_run_id is None: return
     try:
         with conn.cursor() as cur:
             query = sql.SQL("""
-                INSERT INTO experiment_results (experiment_id, episode, training_reward, average_loss, epsilon_approx, avg_eval_score)
-                VALUES (%s, %s, %s, %s, %s, %s);
+                INSERT INTO evaluation_results (experiment_run_id, episode, avg_eval_score)
+                VALUES (%s, %s, %s);
             """)
-            cur.execute(query, (
-                data['experiment_id'],
-                data['episode'],
-                data['training_reward'],
-                data['average_loss'],
-                data['epsilon_approx'],
-                data['avg_eval_score']
-            ))
+            cur.execute(query, (experiment_run_id, episode, avg_score))
             conn.commit()
     except Exception as e:
-        logger.error(f"Error logging to database: {e}")
+        logger.error(f"Error logging evaluation result to database: {e}")
         conn.rollback()
 
-
+# --- QNetwork and DQNAgent Classes (No changes needed here) ---
 class QNetwork(nn.Module):
-    """Neural Network for Q-value approximation."""
     def __init__(self, state_size: int, action_size: int, first_hid: int, second_hid: int):
         super(QNetwork, self).__init__()
         self.fc1 = nn.Linear(state_size, first_hid)
@@ -163,222 +170,127 @@ class QNetwork(nn.Module):
         return self.fc3(x)
 
 class DQNAgentPyTorch:
-    """Deep Q-Network Agent implemented with PyTorch."""
     def __init__(self, state_size: int, action_size: int, config: Dict[str, Any], agent_device: torch.device):
-        self.config: Dict[str, Any] = config
-        self.state_size: int = state_size
-        self.action_size: int = action_size
-        self.device: torch.device = agent_device
-        self.memory: Deque = deque(maxlen=self.config['replay_memory_capacity'])
-        self.gamma: float = self.config['gamma']
-        self.epsilon: float = 1.0
-        self.epsilon_min: float = 0.01
-        self.epsilon_decay: float = self.config['epsilon_decay']
-        self.learning_rate: float = self.config['learning_rate']
-        self.batch_size: int = self.config['batch_size']
-        self.model: QNetwork = QNetwork(state_size, action_size, self.config['first_hid'], self.config['second_hid']).to(self.device)
-        self.optimizer: optim.Optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
-        if self.config['loss_function_type'].lower() == 'mse':
-            self.loss_fn: nn.Module = nn.MSELoss()
-        else:
-            self.loss_fn = nn.MSELoss()
-    def remember(self, state: np.ndarray, action: int, reward: float, next_state: np.ndarray, done: bool) -> None:
-        self.memory.append((state.flatten(), action, reward, next_state.flatten(), done))
-    def act(self, state_np: np.ndarray, explore: bool = True) -> int:
-        if explore and random.random() <= self.epsilon:
-            return random.randrange(self.action_size)
-        if state_np.ndim > 1:
-            state_np = state_np.flatten()
-        state_tensor: torch.Tensor = torch.from_numpy(state_np).float().unsqueeze(0).to(self.device)
+        self.config = config
+        self.state_size, self.action_size = state_size, action_size
+        self.device = agent_device
+        self.memory = deque(maxlen=self.config['replay_memory_capacity'])
+        self.gamma = self.config['gamma']
+        self.epsilon, self.epsilon_min, self.epsilon_decay = 1.0, 0.01, self.config['epsilon_decay']
+        self.learning_rate = self.config['learning_rate']
+        self.batch_size = self.config['batch_size']
+        self.model = QNetwork(state_size, action_size, self.config['first_hid'], self.config['second_hid']).to(self.device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        self.loss_fn = nn.MSELoss()
+    def remember(self, state, action, reward, next_state, done): self.memory.append((state.flatten(), action, reward, next_state.flatten(), done))
+    def act(self, state_np, explore=True):
+        if explore and random.random() <= self.epsilon: return random.randrange(self.action_size)
+        state_tensor = torch.from_numpy(state_np.flatten()).float().unsqueeze(0).to(self.device)
         self.model.eval()
-        with torch.no_grad():
-            action_values: torch.Tensor = self.model(state_tensor)
+        with torch.no_grad(): action_values = self.model(state_tensor)
         self.model.train()
         return torch.argmax(action_values[0]).item()
-    def replay(self) -> float:
-        if len(self.memory) < self.batch_size:
-            return 0.0
-        minibatch: List = random.sample(self.memory, self.batch_size)
-        states_np = np.array([experience[0] for experience in minibatch])
-        actions_np = np.array([experience[1] for experience in minibatch])
-        rewards_np = np.array([experience[2] for experience in minibatch])
-        next_states_np = np.array([experience[3] for experience in minibatch])
-        dones_np = np.array([experience[4] for experience in minibatch])
-        states_tensor = torch.from_numpy(states_np).float().to(self.device)
-        actions_tensor = torch.from_numpy(actions_np).long().unsqueeze(-1).to(self.device)
-        rewards_tensor = torch.from_numpy(rewards_np).float().unsqueeze(-1).to(self.device)
-        next_states_tensor = torch.from_numpy(next_states_np).float().to(self.device)
-        dones_tensor = torch.from_numpy(dones_np.astype(np.uint8)).float().unsqueeze(-1).to(self.device)
-        current_q_values: torch.Tensor = self.model(states_tensor).gather(1, actions_tensor)
+    def replay(self):
+        if len(self.memory) < self.batch_size: return 0.0
+        minibatch = random.sample(self.memory, self.batch_size)
+        states, actions, rewards, next_states, dones = map(lambda x: torch.from_numpy(np.array(x)).to(self.device), zip(*minibatch))
+        states, rewards, dones = states.float(), rewards.float().unsqueeze(-1), dones.long().unsqueeze(-1)
+        actions = actions.long().unsqueeze(-1)
+        next_states = next_states.float()
+        current_q = self.model(states).gather(1, actions)
         with torch.no_grad():
-            next_q_values_all_actions: torch.Tensor = self.model(next_states_tensor)
-            max_next_q_values: torch.Tensor = next_q_values_all_actions.max(1)[0].unsqueeze(-1)
-            target_q_values: torch.Tensor = rewards_tensor + (self.gamma * max_next_q_values * (1 - dones_tensor))
-        loss: torch.Tensor = self.loss_fn(current_q_values, target_q_values)
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
-            self.epsilon = max(self.epsilon_min, self.epsilon)
+            next_q = self.model(next_states).max(1)[0].unsqueeze(-1)
+            target_q = rewards + (self.gamma * next_q * (1 - dones))
+        loss = self.loss_fn(current_q, target_q)
+        self.optimizer.zero_grad(); loss.backward(); self.optimizer.step()
+        if self.epsilon > self.epsilon_min: self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
         return loss.item()
-    def load(self, filepath: str) -> bool:
-        if not os.path.exists(filepath):
-             logger.warning(f"Weight file not found at {filepath}. Starting with a new model.")
-             return False
+    def save(self, filepath):
         try:
-            self.model.load_state_dict(torch.load(filepath, map_location=self.device))
-            self.model.eval()
-            logger.info(f"Successfully loaded model weights from {filepath}")
-            return True
-        except Exception as e:
-            logger.error(f"Error loading model weights from {filepath}: {e}")
-            return False
-    def save(self, filepath: str) -> None:
-        try:
-            # Ensure the output directory exists
             os.makedirs(os.path.dirname(filepath), exist_ok=True)
             torch.save(self.model.state_dict(), filepath)
-            logger.info(f"Successfully saved model weights to {filepath}")
-        except Exception as e:
-            logger.error(f"Error saving model weights to {filepath}: {e}")
+            logger.info(f"Saved model to {filepath}")
+        except Exception as e: logger.error(f"Error saving model: {e}")
 
-def plot_training_results(df_results: pd.DataFrame, plot_path: str, title_suffix: str = "") -> None:
-    plt.figure(figsize=(12, 6))
-    if "training_reward" in df_results.columns:
-        plt.plot(df_results['episode'], df_results['training_reward'], label='Training Score per Episode', alpha=0.6)
-    if "avg_eval_score" in df_results.columns:
-        plt.plot(df_results['episode'], df_results['avg_eval_score'].ffill(), label='Avg Eval Score', color='darkorange', linewidth=2)
-    plt.title(f'Lunar Lander DQN Training Progress ({EXPERIMENT_ID}){title_suffix}', fontsize=16)
-    plt.xlabel('Training Episode Number', fontsize=14)
-    plt.ylabel('Score', fontsize=14)
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    try:
-        os.makedirs(os.path.dirname(plot_path), exist_ok=True)
-        plt.savefig(plot_path)
-        logger.info(f"Plot saved to {plot_path}")
-    except Exception as e:
-        logger.error(f"Failed to save plot to {plot_path}: {e}")
-
-def run_evaluation_phase(env: gym.Env, agent: DQNAgentPyTorch, num_episodes: int, max_steps: int, phase_name: str = "Evaluation") -> Tuple[List[float], float]:
-    logger.info(f"--- Starting {phase_name} Phase ({num_episodes} episodes) ---")
-    eval_rewards_list: List[float] = []
-    for eval_ep in range(1, num_episodes + 1):
-        current_state_tuple: Tuple[np.ndarray, Dict] = env.reset()
-        current_state_np: np.ndarray = current_state_tuple[0]
-        eval_episode_reward: float = 0.0
+# --- Evaluation and Plotting ---
+def run_evaluation_phase(env, agent, num_episodes, max_steps):
+    scores = []
+    for _ in range(num_episodes):
+        state, _ = env.reset()
+        score = 0
         for _ in range(max_steps):
-            action: int = agent.act(current_state_np, explore=False)
-            next_state_tuple, reward, terminated, truncated, _ = env.step(action)
-            done: bool = terminated or truncated
-            current_state_np = next_state_tuple
-            eval_episode_reward += reward
-            if done:
-                break
-        eval_rewards_list.append(eval_episode_reward)
-    avg_eval_reward: float = np.mean(eval_rewards_list).item() if eval_rewards_list else -float('inf')
-    logger.info(f"--- {phase_name} Complete | Average Score: {avg_eval_reward:.2f} ---")
-    return eval_rewards_list, avg_eval_reward
+            action = agent.act(state, explore=False)
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            state = next_state
+            score += reward
+            if terminated or truncated: break
+        scores.append(score)
+    return np.mean(scores) if scores else -float('inf')
 
-def main() -> None:
-    """Main function to run the DQN agent training and evaluation."""
-    logger.info(f"Starting PyTorch DQN script for LunarLander-v3. Experiment ID: {EXPERIMENT_ID}")
-
-    # --- Database Setup ---
-    db_conn = get_db_connection()
-    setup_database_table(db_conn)
-
-    # --- Environment Setup ---
+def plot_results(db_conn, experiment_run_id):
+    if not db_conn or experiment_run_id is None: return
+    df = pd.read_sql(f"SELECT episode, avg_eval_score FROM evaluation_results WHERE experiment_run_id = {experiment_run_id} ORDER BY episode", db_conn)
+    if df.empty:
+        logger.warning("No evaluation data to plot.")
+        return
+    plt.figure(figsize=(12, 6))
+    plt.plot(df['episode'], df['avg_eval_score'], marker='o', linestyle='-', label='Avg Eval Score')
+    plt.title(f'Evaluation Scores for {EXPERIMENT_ID}', fontsize=16)
+    plt.xlabel('Training Episode', fontsize=14)
+    plt.ylabel('Average Score', fontsize=14)
+    plt.grid(True); plt.legend(); plt.tight_layout()
     try:
-        env: gym.Env = gym.make("LunarLander-v3")
+        os.makedirs(os.path.dirname(PLOT_PATH), exist_ok=True)
+        plt.savefig(PLOT_PATH)
+        logger.info(f"Plot saved to {PLOT_PATH}")
     except Exception as e:
-        logger.error(f"Failed to create Gymnasium environment: {e}")
+        logger.error(f"Failed to save plot: {e}")
+
+# --- Main Execution ---
+def main():
+    logger.info(f"Starting experiment: {EXPERIMENT_ID}")
+    logger.info(f"Hyperparameters: {exp_spec}")
+    
+    db_conn = get_db_connection()
+    setup_database_tables(db_conn)
+    experiment_run_id = get_or_create_experiment(db_conn, exp_spec)
+
+    if experiment_run_id is None:
+        logger.error("Could not obtain a valid experiment ID. Aborting.")
         return
 
-    state_size: int = env.observation_space.shape[0]
-    action_size: int = env.action_space.n
-
-    # --- Agent Initialization ---
-    agent: DQNAgentPyTorch = DQNAgentPyTorch(state_size, action_size, config=exp_spec, agent_device=device)
-
-    # --- Main Training Loop ---
-    logger.info(f"--- Starting Main Training Phase: {EPISODES} episodes ---")
-    
-    all_results = [] # To store data for the final plot
+    env = gym.make("LunarLander-v3")
+    agent = DQNAgentPyTorch(env.observation_space.shape[0], env.action_space.n, config=exp_spec, agent_device=device)
 
     for e in range(1, EPISODES + 1):
-        current_state_tuple: Tuple[np.ndarray, Dict] = env.reset()
-        current_state_np: np.ndarray = current_state_tuple[0]
-        training_episode_reward: float = 0.0
-        episode_loss_sum: float = 0.0
-        num_replay_ops: int = 0
-        total_steps_counter = 0
-
-        for step_in_episode in range(MAX_STEPS_PER_EPISODE):
-            action: int = agent.act(current_state_np, explore=True)
-            next_state_tuple, reward, terminated, truncated, _ = env.step(action)
-            done: bool = terminated or truncated
-            agent.remember(current_state_np, action, reward, next_state_tuple, done)
-            current_state_np = next_state_tuple
-            training_episode_reward += reward
-            total_steps_counter += 1
-
-            if len(agent.memory) >= agent.batch_size and total_steps_counter % agent.config['step_to_update'] == 0:
-                loss = agent.replay()
-                if loss is not None:
-                    episode_loss_sum += loss
-                    num_replay_ops += 1
-            if done:
-                break
+        state, _ = env.reset()
+        score, loss_sum, replay_ops = 0, 0, 0
+        for _ in range(MAX_STEPS_PER_EPISODE):
+            action = agent.act(state, explore=True)
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            agent.remember(state, action, reward, next_state, done)
+            state = next_state
+            score += reward
+            if len(agent.memory) >= agent.batch_size and e % agent.config['step_to_update'] == 0:
+                loss_sum += agent.replay(); replay_ops += 1
+            if done: break
         
-        avg_episode_loss = (episode_loss_sum / num_replay_ops) if num_replay_ops > 0 else 0.0
-        
-        log_data = {
-            "episode": e,
-            "training_reward": training_episode_reward,
-            "average_loss": avg_episode_loss,
-            "epsilon_approx": agent.epsilon,
-            "avg_eval_score": None # Placeholder
-        }
+        avg_loss = (loss_sum / replay_ops) if replay_ops > 0 else 0
+        logger.info(f"Exp: {EXPERIMENT_ID} | Ep: {e}/{EPISODES} | Score: {score:.2f} | Epsilon: {agent.epsilon:.3f} | Avg Loss: {avg_loss:.4f}")
 
-        # --- Periodic Evaluation ---
         if e % EVALUATION_FREQUENCY == 0:
-            _, avg_score_this_eval_run = run_evaluation_phase(
-                env, agent, EVAL_EPISODES_COUNT, MAX_STEPS_PER_EPISODE, f"Periodic Eval (after Ep {e})"
-            )
-            log_data["avg_eval_score"] = avg_score_this_eval_run
-            if avg_score_this_eval_run >= TARGET_SCORE_AVG:
+            avg_eval_score = run_evaluation_phase(env, agent, EVAL_EPISODES_COUNT, MAX_STEPS_PER_EPISODE)
+            logger.info(f"--- Evaluation after Ep {e} | Avg Score: {avg_eval_score:.2f} ---")
+            log_evaluation_to_database(db_conn, experiment_run_id, e, avg_eval_score)
+            if avg_eval_score >= TARGET_SCORE_AVG:
                 logger.info(f"Environment SOLVED after episode {e}!")
-                agent.save(MODEL_SAVE_PATH)
-                log_to_database(db_conn, log_data)
-                all_results.append(log_data)
-                break # End training
-        
-        logger.info(
-            f"Exp: {EXPERIMENT_ID} | Episode: {e}/{EPISODES} | Score: {training_episode_reward:.2f} | "
-            f"Epsilon: {agent.epsilon:.3f} | Avg Loss: {avg_episode_loss:.4f}"
-        )
-        
-        # Log to DB
-        log_to_database(db_conn, log_data)
-        all_results.append(log_data)
-
-        if e % 50 == 0:
-            agent.save(MODEL_SAVE_PATH)
-
-    # --- Finalization ---
-    agent.save(MODEL_SAVE_PATH)
-    env.close()
-    if db_conn:
-        db_conn.close()
+                break
     
-    # Generate and save plot from collected results
-    if all_results:
-        results_df = pd.DataFrame(all_results)
-        plot_training_results(results_df, PLOT_PATH)
-
+    agent.save(MODEL_SAVE_PATH)
+    plot_results(db_conn, experiment_run_id)
+    env.close()
+    if db_conn: db_conn.close()
     logger.info(f"Experiment {EXPERIMENT_ID} finished.")
 
 if __name__ == "__main__":

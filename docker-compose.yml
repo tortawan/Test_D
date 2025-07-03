@@ -21,44 +21,58 @@ services:
       - experiment-net
 
   # ---------------------
-  # Experiment 1 Service
+  # Experiment 1 Service (e.g., lower learning rate)
   # ---------------------
   lunar-lander-exp1:
     build: .
     container_name: lunar-lander-exp1
     environment:
+      # --- Experiment & DB Config ---
       - DB_HOST=db
       - POSTGRES_USER=user
       - POSTGRES_PASSWORD=password
       - POSTGRES_DB=experiments
-      - EXPERIMENT_ID=exp-1-alpha
-    volumes:
-      # Mounts a local folder to save the model weights and plot
-      - ./outputs/exp1:/app/outputs
+      - EXPERIMENT_ID=exp-lr-low-gamma-high
+      # --- Hyperparameters ---
+      - LEARNING_RATE=0.0001
+      - GAMMA=0.995
+      - BATCH_SIZE=256
+      - FIRST_HID=350
+      - SECOND_HID=150
+      - EPSILON_DECAY=0.99
     depends_on:
       - db
     networks:
       - experiment-net
+    volumes:
+      - ./outputs/exp1:/app/outputs
 
   # ---------------------
-  # Experiment 2 Service
+  # Experiment 2 Service (e.g., higher learning rate)
   # ---------------------
   lunar-lander-exp2:
     build: .
     container_name: lunar-lander-exp2
     environment:
+      # --- Experiment & DB Config ---
       - DB_HOST=db
       - POSTGRES_USER=user
       - POSTGRES_PASSWORD=password
       - POSTGRES_DB=experiments
-      - EXPERIMENT_ID=exp-2-beta # A different ID for this experiment
-    volumes:
-      # Mounts a different local folder for this experiment's outputs
-      - ./outputs/exp2:/app/outputs
+      - EXPERIMENT_ID=exp-lr-high-gamma-low
+      # --- Hyperparameters ---
+      - LEARNING_RATE=0.001
+      - GAMMA=0.99
+      - BATCH_SIZE=512
+      - FIRST_HID=350
+      - SECOND_HID=150
+      - EPSILON_DECAY=0.99
     depends_on:
       - db
     networks:
       - experiment-net
+    volumes:
+      - ./outputs/exp2:/app/outputs
 
 # Define the network that allows containers to communicate
 networks:
@@ -68,3 +82,4 @@ networks:
 # Define the volume for persistent database storage
 volumes:
   postgres_data:
+
